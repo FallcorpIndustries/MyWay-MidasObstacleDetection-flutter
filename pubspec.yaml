@@ -1,0 +1,89 @@
+# Nom du projet Flutter. Doit correspondre au nom du dossier si publié.
+name: assistive_perception_app
+
+# Une courte description de ce que fait l'application.
+description: Phase 1 Assistive Perception App using MiDaS and RANSAC.
+
+# 'publish_to: none' empêche la publication accidentelle de ce package sur pub.dev.
+# Retirez cette ligne si vous avez l'intention de publier le package.
+publish_to: 'none'
+
+# La version actuelle de l'application.
+# Suivant la convention version+build number (MAJOR.MINOR.PATCH+BUILD).
+version: 1.0.0+1
+
+# Définit la plage de versions du SDK Dart avec laquelle ce projet est compatible.
+# Assurez-vous que votre installation Flutter utilise un SDK dans cette plage.
+environment:
+  sdk: '>=3.2.0 <4.0.0' # Exemple : compatible avec Dart 3.2.0 et supérieur, mais pas Dart 4.0.0
+
+# Section listant les dépendances externes (packages) requises par l'application.
+dependencies:
+  # Dépendance fondamentale pour construire des applications Flutter.
+  flutter:
+    sdk: flutter
+
+  # === Plugins Essentiels pour la Phase 1 ===
+
+  # Plugin pour accéder aux flux de la caméra de l'appareil.
+  # Indispensable pour obtenir les images en temps réel.
+  # Vérifiez la dernière version compatible sur pub.dev : https://pub.dev/packages/camera
+  camera: ^0.10.5+9 # Version à jour au moment de la rédaction, peut nécessiter une mise à jour.
+
+  # Plugin TensorFlow Lite pour exécuter des modèles ML sur l'appareil.
+  # Utilisé ici pour le modèle de profondeur MiDaS.
+  # C'est le plugin principal géré par la communauté TF Lite.
+  # Vérifiez la dernière version : https://pub.dev/packages/tflite_flutter
+  tflite_flutter: ^0.11.0 # Version compatible avec tflite_flutter_helper_plus au moment de la rédaction.
+
+  # Bibliothèque d'aide pour tflite_flutter. Simplifie le pré-traitement des images
+  # (redimensionnement, normalisation) et la manipulation des tenseurs d'entrée/sortie.
+  # Vérifiez la dernière version : https://pub.dev/packages/tflite_flutter_helper_plus
+  #tflite_flutter_helper_plus: ^0.0.2 # Assurez-vous de la compatibilité avec tflite_flutter
+
+  # Plugin pour la synthèse vocale (Text-to-Speech).
+  # Utilisé pour donner un retour audio à l'utilisateur.
+  # Vérifiez la dernière version : https://pub.dev/packages/flutter_tts
+  flutter_tts: ^4.2.2 # Version à jour au moment de la rédaction.
+
+  # Package pour l'Interface de Fonctions Étrangères (Foreign Function Interface - FFI).
+  # Permet au code Dart d'appeler du code natif (C/C++ dans notre cas) compilé.
+  # Crucial pour les tâches gourmandes en performance comme la conversion YUV et RANSAC.
+  # Vérifiez la dernière version : https://pub.dev/packages/ffi
+  ffi: ^2.1.0
+
+  # Package pour la manipulation d'images en Dart pur.
+  # Utile pour des conversions ou manipulations simples si nécessaire, mais
+  # le travail lourd (YUV->RGB) sera fait via FFI pour la performance.
+  # Vérifiez la dernière version : https://pub.dev/packages/image
+  image: 3.3.0
+
+  # === Plugins Optionnels (Non strictement requis pour Phase 1 mais utiles) ===
+
+  # # Plugin pour obtenir des chemins de répertoire courants sur l'appareil (non utilisé en Phase 1).
+  # path_provider: ^2.0.11
+  # # Package pour manipuler les chemins de fichiers de manière multiplateforme (non utilisé en Phase 1).
+  # path: ^1.8.2
+
+# Section listant les dépendances utilisées uniquement pour le développement et les tests.
+dev_dependencies:
+  # Framework de test de base pour Flutter.
+  flutter_test:
+    sdk: flutter
+
+  # Ensemble de règles de "linting" recommandées pour améliorer la qualité du code Dart.
+  flutter_lints: ^5.0.0 # Ou version plus récente
+
+  # Outil pour générer automatiquement les liaisons FFI (bindings) Dart
+  # à partir de fichiers d'en-tête C/C++. Simplifie la configuration FFI.
+  # Nous allons écrire les liaisons manuellement pour des raisons pédagogiques ici,
+  # mais ffigen est l'outil recommandé pour des projets plus complexes.
+  # # ffigen: ^8.0.2 # Décommenter si vous voulez utiliser ffigen plus tard.
+
+# Configuration spécifique à Flutter.
+flutter:
+  uses-material-design: true # 2 spaces indentation
+
+  assets:                   # 2 spaces indentation
+    - assets/               # 4 spaces indentation
+    - assets/midas_small_quant.tflite # 4 spaces indentation

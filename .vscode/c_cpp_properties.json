@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "name": "Android",
+            "includePath": [
+                "${workspaceFolder}/**",
+                // Chemin principal des includes NDK (pour stdint.h, android/log.h) :
+                "C:/Users/fallm/AppData/Local/Android/Sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include",
+                // AJOUTEZ LE CHEMIN vers les includes C++ standard ici :
+                "C:\\Users\\fallm\\AppData\\Local\\Android\\Sdk\\ndk\\27.0.12077973\\toolchains\\llvm\\prebuilt\\windows-x86_64\\sysroot\\usr\\include\\c++\\v1"
+                // (Adaptez 'v1' si nécessaire)
+            ],
+            "defines": [
+                "_DEBUG",
+                "UNICODE",
+                "_UNICODE"
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-clang-arm64", // Vous pouvez laisser ou enlever cette ligne
+            "configurationProvider": "ms-vscode.cmake-tools" // Gardez ceci
+        }
+    ],
+    "version": 4
+}

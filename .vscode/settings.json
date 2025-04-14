@@ -1,0 +1,13 @@
+{
+    "cmake.sourceDirectory": "C:/Users/fallm/Documents/FlutterApp/assistive_perception_app/assistive_perception_app/android/app/src/main/cpp",
+
+    // AJOUTEZ CETTE LIGNE (avec le bon chemin !) :
+    "cmake.cmakePath": "C:\\Users\\fallm\\AppData\\Local\\Android\\Sdk\\cmake\\3.31.6\\bin\\cmake.exe",
+    "files.associations": {
+        "utility": "cpp",
+        "algorithm": "cpp",
+        "stdexcept": "cpp"
+    }
+    // Ou si vous préférez les double backslashs :
+    // "cmake.cmakePath": "C:\\Users\\fallm\\AppData\\Local\\Android\\Sdk\\cmake\\3.31.6\\bin\\cmake.exe"
+}
