@@ -69,46 +69,50 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     log("MyHomePage: initState", name: "MainUI");
-    WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addObserver(this); // Pour gérer pause/reprise
 
+    // Crée les instances
     _cameraService = CameraService();
     _tfliteService = TFLiteService();
     _preprocessingService = PreprocessingService();
     _depthAnalyzer = DepthAnalyzer();
     _audioFeedbackService = AudioFeedbackService();
 
-    _initializeAsyncServices();
+    _initializeAsyncServices(); // Lance l'initialisation
+  }
+
+  @override
+  void dispose() {
+    log("MyHomePage: dispose", name: "MainUI");
+    WidgetsBinding.instance.removeObserver(this);
+    // Libère les ressources proprement
+    Future.microtask(() async {
+      await _cameraService.dispose();
+      _tfliteService.dispose();
+      await _audioFeedbackService.dispose();
+      log("MyHomePage: Services disposed", name: "MainUI");
+    });
+    super.dispose();
   }
 
    @override
-  void dispose() {
-     log("MyHomePage: dispose", name: "MainUI");
-     WidgetsBinding.instance.removeObserver(this);
-     Future.microtask(() async {
-       await _cameraService.dispose();
-       _tfliteService.dispose();
-       await _audioFeedbackService.dispose();
-       log("MyHomePage: Services disposed", name: "MainUI");
-     });
-     super.dispose();
-   }
-
-   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-      final CameraController? cameraController = _controller;
-      if (cameraController == null || !cameraController.value.isInitialized) return;
-      if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
-        log("App Lifecycle: Inactive/Paused - Stopping stream", name: "MainUI");
-         _cameraService.stopStreaming();
-      } else if (state == AppLifecycleState.resumed) {
-         log("App Lifecycle: Resumed - Restarting stream", name: "MainUI");
-        if (_servicesInitialized && !_cameraService.isStreaming) {
-           _startCameraStream();
-        }
-      }
-   }
+    // Gère pause/reprise de la caméra
+    final CameraController? cameraController = _controller;
+    if (cameraController == null || !cameraController.value.isInitialized) return;
 
-  // --- Initialisation Asynchrone AVEC TEST D'ASSET (utilisant print) ---
+    if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
+      log("App Lifecycle: Inactive/Paused - Stopping stream", name: "MainUI");
+       _cameraService.stopStreaming();
+    } else if (state == AppLifecycleState.resumed) {
+       log("App Lifecycle: Resumed - Restarting stream", name: "MainUI");
+      if (_servicesInitialized && !_cameraService.isStreaming) { // Vérifie si pas déjà en cours
+         _startCameraStream();
+      }
+    }
+  }
+
+  // --- Initialisation Asynchrone AVEC TEST D'ASSET ---
   Future<void> _initializeAsyncServices() async {
     log("Initialisation des services...", name: "MainUI");
     if (!mounted) return;
@@ -132,8 +136,7 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
 
     // --- Suite de l'initialisation ---
     setState(() { _statusMessage = "Asset OK. Chargement du modèle TFLite..."; });
-    // TFLiteService utilise print() dans son catch pour afficher l'erreur si fromBuffer échoue
-    bool tfliteOk = await _tfliteService.loadModel();
+    bool tfliteOk = await _tfliteService.loadModel(); // TFLiteService utilise print() dans son catch
     if (!mounted) return;
     if (!tfliteOk) { setState(() { _isInitializing = false; _servicesInitialized = false; _statusMessage = "Erreur TFLite: Modèle non chargé.\n(Vérifiez logs 'ERREUR FATALE')"; }); return; }
 
@@ -169,37 +172,39 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
    }
 
 
-  // --- Pipeline Traitement Image (avec MARQUEURS print) ---
+  // --- Pipeline Traitement Image (TYPES CORRIGÉS pour variables) ---
   // Orchestre l'appel séquentiel des services pour chaque image
   Future<void> _processCameraImage(CameraImage image) async {
     if (!_servicesInitialized || !mounted) return;
     final processingWatch = Stopwatch()..start();
     try {
-      // MARQUEUR DE DÉBUT DE FRAME
-      print("--- Frame Start ---");
+      print("--- Frame Start ---"); // Marqueur Début
 
-      // 1. Prétraitement (Copie Dart->Natif, FFI(libyuv), Copie Natif->Dart, Resize/Norm Dart)
-      final List<List<List<List<double>>>>? inputData =
+      // 1. Prétraitement -> retourne List<...<int>>?
+      // CORRECTION TYPE: inputData est bien List<...<int>>?
+      final List<List<List<List<int>>>>? inputData =
           await _preprocessingService.preprocessCameraImage(image);
+
       if (!mounted) { processingWatch.stop(); return; }
-      // MARQUEUR APRÈS PRÉTRAITEMENT
-      print("--- Step 1: Preprocessing Done (inputData is ${inputData == null ? 'null' : 'OK'}) ---");
+      print("--- Step 1: Preprocessing Done (inputData is ${inputData == null ? 'null' : 'OK'}) ---"); // Marqueur 1
       if (inputData == null) { processingWatch.stop(); return; }
 
-      // 2. Inférence TFLite
+      // 2. Inférence TFLite -> prend List<...<int>>, retourne List<...<double>>?
+      // CORRECTION TYPE: outputData est bien List<...<double>>?
       final List<List<List<double>>>? outputData =
-          await _tfliteService.runInference(inputData);
+          await _tfliteService.runInference(inputData); // Passe la liste d'int
+
       if (!mounted) { processingWatch.stop(); return; }
-      // MARQUEUR APRÈS INFÉRENCE
-      print("--- Step 2: Inference Done (outputData is ${outputData == null ? 'null' : 'OK'}) ---");
+      print("--- Step 2: Inference Done (outputData is ${outputData == null ? 'null' : 'OK'}) ---"); // Marqueur 2
       if (outputData == null) { processingWatch.stop(); return; }
 
-      // 3. Analyse de Profondeur (Logique Dart, Appel FFI RANSAC placeholder)
+      // 3. Analyse de Profondeur -> prend List<...<double>>?
+      // Le type de outputData est correct pour cette fonction
       final DepthAnalysisResult? analysisResult =
-          await _depthAnalyzer.analyzeDepthMap(outputData);
+          await _depthAnalyzer.analyzeDepthMap(outputData); // Passe la liste de double
+
       if (!mounted) { processingWatch.stop(); return; }
-      // MARQUEUR APRÈS ANALYSE
-      print("--- Step 3: Analysis Done (analysisResult is ${analysisResult == null ? 'null' : 'OK'}) ---");
+      print("--- Step 3: Analysis Done (analysisResult is ${analysisResult == null ? 'null' : 'OK'}) ---"); // Marqueur 3
       if (analysisResult == null) { processingWatch.stop(); return; }
 
       // 4. Affichage Résultat Console (Remplace TTS pour l'instant)
@@ -209,11 +214,10 @@ class _MyHomePageState extends State<MyHomePage> with WidgetsBindingObserver {
       print(" -> Mur: ${analysisResult.wallDirection.name} (Rappel: RANSAC est vide, doit être None)");
       print(" -> Chemin Libre: ${analysisResult.freePathDirection.name}");
       print("-----------------------------------------");
-      // MARQUEUR FIN
-      print("--- Step 4: Result Print Done ---");
+      print("--- Step 4: Result Print Done ---"); // Marqueur Fin
 
       processingWatch.stop();
-      log("Pipeline: ${processingWatch.elapsedMilliseconds} ms", name: "MainUI"); // Temps total du pipeline
+      log("Pipeline: ${processingWatch.elapsedMilliseconds} ms", name: "MainUI");
 
     } catch (e, stacktrace) {
        // Utilise print pour assurer la visibilité de l'erreur du pipeline
