@@ -1,277 +1,212 @@
 package com.example.depthperceptionapp.analysis
+// Adaptez le nom du package si nécessaire
 
 import android.util.Log
+import com.example.depthperceptionapp.Config // Importer les constantes
 import com.example.depthperceptionapp.ndk.NdkBridge
-import com.example.depthperceptionapp.tflite.DepthPredictor // For accessing output dims
+import com.example.depthperceptionapp.analysis.DetectionState // Importer data class externe
+import com.example.depthperceptionapp.analysis.VisualizationData // Importer data class externe
+import com.example.depthperceptionapp.analysis.WallDirection // Importer enum externe
+// PAS d'import pour FreePathResult car défini DANS la classe
 import java.nio.FloatBuffer
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.sqrt
 
 /**
- * Data class to hold the combined results of the analysis for a single frame.
- * Represents the perceived state of the environment at a specific moment.
- */
-data class DetectionState(
-    val timestamp: Long = System.currentTimeMillis(), // Time when the state was generated
-    val maxObstacleDepth: Float = 0.0f, // Highest relative inverse depth of detected obstacles (higher = closer)
-    val wallDetected: Boolean = false,   // Flag indicating if a significant plane likely representing a wall was found
-    // TODO: Add wall details (e.g., direction, plane equation) if needed later
-    val freePathDirection: AnalysisManager.FreePathResult = AnalysisManager.FreePathResult.UNKNOWN // Enum indicating the estimated clearest path
-)
-
-/**
- * Manages the analysis of the depth map produced by the TFLite model.
- * This class orchestrates the different analysis steps:
- * - Obstacle detection (basic thresholding) + Coord Collection
- * - Wall detection (using NDK RANSAC)
- * - Free path estimation (simple ROI analysis) + Coord Collection
- * Returns VisualizationData containing detailed results.
- *
- * IMPORTANT: All analysis methods operating on the depth map should ideally be called
- * from a background thread/coroutine.
+ * Gère l'analyse de la carte de profondeur. Définit FreePathResult en interne.
  */
 class AnalysisManager {
 
+    // --- Enum FreePathResult défini à l'intérieur ---
+    enum class FreePathResult { LEFT, CENTER, RIGHT, BLOCKED, UNKNOWN }
+    // ---------------------------------------------
+
     companion object {
         private const val TAG = "AnalysisManager"
+        private const val DEBUG_TAG = "MyWayDebug"
+        // Zones pour logging
+        private val NEAR_ZONE_Y_RANGE = 0.8f..1.0f
+        private val NEAR_ZONE_X_RANGE = 0.25f..0.75f
+        private val FAR_ZONE_Y_RANGE = 0.4f..0.6f
+        private val FAR_ZONE_X_RANGE = 0.4f..0.6f
     }
 
-    /*
-     * ============================================================
-     * == Key Configurable Parameters, Defaults, and Tuning Notes ==
-     * ============================================================
-     * | Parameter                  | Default Value | Tuning Notes                                                                    | Location      |
-     * |----------------------------|---------------|---------------------------------------------------------------------------------|---------------|
-     * | Camera Intrinsics (fx)     | 525.0f        | !! PLACEHOLDER !! Calibrate per device/camera. Focal length X (pixels).        | Analysis Mgr. |
-     * | Camera Intrinsics (fy)     | 525.0f        | !! PLACEHOLDER !! Calibrate per device/camera. Focal length Y (pixels).        | Analysis Mgr. |
-     * | Camera Intrinsics (cx)     | 128.0f        | !! PLACEHOLDER !! Calibrate per device/camera. Principal point X (pixels, w=256).| Analysis Mgr. |
-     * | Camera Intrinsics (cy)     | 128.0f        | !! PLACEHOLDER !! Calibrate per device/camera. Principal point Y (pixels, h=256).| Analysis Mgr. |
-     * | RANSAC Dist. Threshold     | 0.05f         | !! TUNE !! Max distance for inliers (approx meters if depth was metric). Affects sensitivity. | Analysis Mgr. |
-     * | RANSAC Min Inliers         | 500           | !! TUNE !! Min points to form a plane. Depends on point cloud density/wall size. | Analysis Mgr. |
-     * | RANSAC Max Iterations      | 100           | !! TUNE !! Trade-off: performance vs. finding optimal plane robustness.           | Analysis Mgr. |
-     * | Obstacle Closeness Thresh. | 1500.0f       | !! TUNE !! Relative inverse depth threshold (higher = closer). ADJUST FOR DEQUANTIZED SCALE! | Analysis Mgr. |
-     * | Free Path Farness Thresh.  | 0.2f          | !! TUNE !! Relative inverse depth threshold (lower = farther). ADJUST FOR DEQUANTIZED SCALE! | Analysis Mgr. |
-     * | Free Path ROI % Width      | 0.6f          | !! TUNE !! Horizontal portion of view for free path check (60% of width).       | Analysis Mgr. |
-     * | Free Path Blocked Thresh.  | 0.1f          | !! TUNE !! Min percentage of ROI pixels needed to be 'far' to not be 'blocked'. | Analysis Mgr. |
-     * | Wall Normal Vert Thresh.   | 0.8f          | !! TUNE !! Ratio (Z / XY) of normal vector components for wall check (lower = more vertical). | Analysis Mgr. |
-     * | Input Norm. Mean           | N/A (UINT8)   | !! VERIFY MODEL REQS !! Usually 0 for UINT8 models.                               | DepthAnalyzer |
-     * | Input Norm. Std            | N/A (UINT8)   | !! VERIFY MODEL REQS !! Usually 1 (or 255 if scaling) for UINT8. Raw pixels used now. | DepthAnalyzer |
-     * | TFLite Num Threads         | 4             | !! TUNE !! Based on device CPU cores and performance testing.                     | DepthPredictor|
-     * | TTS Throttle Millis        | 1500L         | !! TUNE !! Desired feedback frequency vs. user overload.                          | Feedback Mgr. |
-     * | TTS Speech Rate            | 1.0f          | !! TUNE !! For user preference (1.0 = normal).                                  | Feedback Mgr. |
-     * | TTS Pitch                  | 1.0f          | !! TUNE !! For user preference (1.0 = normal).                                  | Feedback Mgr. |
-     */
+    // Pas de constantes définies ici, utilise Config
 
-    // --- Placeholder Camera Intrinsics ---
-    private val DEFAULT_FX = 525.0f // Needs Calibration!
-    private val DEFAULT_FY = 525.0f // Needs Calibration!
-    private val DEFAULT_CX = 128.0f // Needs Calibration! (Relative to 256 width)
-    private val DEFAULT_CY = 128.0f // Needs Calibration! (Relative to 256 height)
-
-    // --- RANSAC Parameters ---
-    private val RANSAC_DISTANCE_THRESHOLD = 0.05f // TUNE
-    private val RANSAC_MIN_INLIERS = 500 // TUNE
-    private val RANSAC_MAX_ITERATIONS = 100 // TUNE
-
-    // --- Obstacle Detection Parameter ---
-    // CRITICAL: Tune this based on observing dequantized maxObstacleDepth logs!
-    val obstacleClosenessThreshold = 1500.0f // EXAMPLE - TUNE THIS VALUE!
-
-    // --- Free Path Estimation Parameters ---
-    // CRITICAL: Tune this based on observing typical dequantized depth values for far areas.
-    private val FREE_PATH_FARNESS_THRESHOLD = 50.0f // EXAMPLE - TUNE THIS VALUE! Start low, maybe increase.
-    private val FREE_PATH_ROI_WIDTH_FRACTION = 0.6f // TUNE
-    private val FREE_PATH_BLOCKED_THRESHOLD_FRACTION = 0.1f // TUNE
-
-    // --- Wall Identification Parameter ---
-    private val WALL_NORMAL_VERTICALITY_THRESHOLD = 0.8f // TUNE
-
-
-    /**
-     * Orchestrates the analysis pipeline, returning detailed VisualizationData.
-     *
-     * @param depthMapFloatBuffer Dequantized FloatBuffer output from DepthPredictor.
-     * @param width Width of the depth map (e.g., 256).
-     * @param height Height of the depth map (e.g., 256).
-     * @return VisualizationData summarizing findings and pixel coordinates.
-     */
+    /** Fonction principale d'analyse */
     fun analyzeDepthMap(depthMapFloatBuffer: FloatBuffer, width: Int, height: Int): VisualizationData {
         val analysisStartTime = System.currentTimeMillis()
         depthMapFloatBuffer.rewind()
 
-        /*
-        *****************************************************
-        ** FUTURE EXPANSION POINT: OBJECT DETECTION        **
-        *****************************************************
-         ... (Keep comment block) ...
-        *****************************************************
-        */
+        logDepthStatsInZones(depthMapFloatBuffer, width, height)
+        depthMapFloatBuffer.rewind()
 
-        // --- Prepare lists to hold coordinates ---
         val obstaclePixels = mutableListOf<Pair<Int, Int>>()
         val freePathPixels = mutableListOf<Pair<Int, Int>>()
 
-        // --- Perform Analysis and Collect Coordinates ---
-
-        // 1. Detect Obstacles & Collect Coords
+        // 1. Obstacles
         val maxObstacleDepth = detectObstaclesAndGetCoords(depthMapFloatBuffer, width, height, obstaclePixels)
-        Log.d(TAG, "Obstacle Detection - Max Depth: $maxObstacleDepth (Threshold: $obstacleClosenessThreshold), Pixels: ${obstaclePixels.size}")
+        Log.d(DEBUG_TAG, "Obstacle Check - Max Depth: %.2f (Thresh: %.2f)".format(maxObstacleDepth, Config.OBSTACLE_CLOSENESS_THRESHOLD))
         depthMapFloatBuffer.rewind()
 
-        // 2. Detect Walls (RANSAC via NDK)
+        // 2. Murs (RANSAC)
         val detectedPlanes = detectWalls(depthMapFloatBuffer, width, height)
         depthMapFloatBuffer.rewind()
 
-        // 3. Identify if a wall-like plane was found
-        val wallDetected = identifyWalls(detectedPlanes)
-        Log.d(TAG, "Wall Identification - Detected: $wallDetected")
+        // 3. Identification Mur/Direction
+        var wallDetected = false
+        var wallDirection = WallDirection.NONE
+        var wallNormalStr = "N/A"
+        if (detectedPlanes != null && detectedPlanes.isNotEmpty()) {
+            val plane = detectedPlanes[0]
+            if (plane.size >= 5) {
+                val nx = plane[0]; val ny = plane[1]; val nz = plane[2]; val inliers = plane[4].toInt()
+                wallNormalStr = "Norm(%.2f, %.2f, %.2f), Inliers:%d".format(nx, ny, nz, inliers)
+                wallDetected = identifyWallFromNormal(nx, ny, nz)
+                if (wallDetected) {
+                    wallDirection = estimateWallDirection(nx, ny)
+                }
+                Log.d(DEBUG_TAG, "RANSAC Result - ${wallNormalStr} -> WallDetected: $wallDetected, WallDirection: $wallDirection")
+            } else {
+                Log.w(TAG, "RANSAC plane array size unexpected: ${plane.size}")
+                Log.d(DEBUG_TAG, "RANSAC Result - Plane data format error.")
+            }
+        } else {
+            Log.d(DEBUG_TAG, "RANSAC Result - No significant plane found.")
+        }
 
-        // 4. Estimate Free Path & Collect Coords
+        // 4. Chemin Libre
+        // Appelle la fonction qui retourne le type interne AnalysisManager.FreePathResult
         val freePathResult = estimateFreePathAndGetCoords(depthMapFloatBuffer, width, height, freePathPixels)
-        Log.d(TAG, "Free Path Estimation - Result: $freePathResult, Pixels: ${freePathPixels.size}")
+        Log.d(DEBUG_TAG, "Free Path Check - Direction: $freePathResult (Thresh: ${Config.FREE_PATH_FARNESS_THRESHOLD}), Far Pixels: ${freePathPixels.size}")
         depthMapFloatBuffer.rewind()
 
-
-        val analysisEndTime = System.currentTimeMillis()
-        // Log.d(TAG, "Full Depth Analysis Time: ${analysisEndTime - analysisStartTime} ms") // Can be verbose
-
-        // 5. Aggregate Results into DetectionState and VisualizationData
-        val detectionState = DetectionState(
+        // 5. Agrégation
+        val finalDetectionState = DetectionState(
             timestamp = System.currentTimeMillis(),
             maxObstacleDepth = maxObstacleDepth,
             wallDetected = wallDetected,
-            freePathDirection = freePathResult
+            wallDirection = wallDirection,
+            freePathDirection = freePathResult // Assigner la valeur de type interne
         )
-
-        return VisualizationData(
-            timestamp = detectionState.timestamp,
-            depthMapWidth = width,
-            depthMapHeight = height,
-            obstaclePixels = obstaclePixels,
-            freePathPixels = freePathPixels,
-            detectionState = detectionState
+        val finalVisualizationData = VisualizationData(
+            timestamp = finalDetectionState.timestamp, depthMapWidth = width, depthMapHeight = height,
+            obstaclePixels = obstaclePixels, freePathPixels = freePathPixels,
+            detectionState = finalDetectionState
         )
+        return finalVisualizationData
     }
 
 
-    /**
-     * Detects obstacles based on threshold AND collects their coordinates.
-     * @param depthMap Dequantized depth map FloatBuffer (position 0).
-     * @param width Depth map width.
-     * @param height Depth map height.
-     * @param outObstacleCoords Mutable list to be populated with (x, y) coords of obstacle pixels.
-     * @return The maximum relative inverse depth value found for obstacles.
-     */
-    fun detectObstaclesAndGetCoords(
-        depthMap: FloatBuffer,
-        width: Int,
-        height: Int,
-        outObstacleCoords: MutableList<Pair<Int, Int>> // Output list
-    ): Float {
-        var maxObstacleDepth = 0.0f
-        outObstacleCoords.clear()
-        depthMap.rewind()
+    /** Loggue les stats de profondeur dans des zones */
+    private fun logDepthStatsInZones(depthMap: FloatBuffer, width: Int, height: Int) {
+        logDepthStatsForZone("NearZone (Lower Center)", depthMap, width, height, NEAR_ZONE_X_RANGE, NEAR_ZONE_Y_RANGE)
+        logDepthStatsForZone("FarZone (Center Middle)", depthMap, width, height, FAR_ZONE_X_RANGE, FAR_ZONE_Y_RANGE)
+    }
 
-        for (y in 0 until height) {
-            for (x in 0 until width) {
+    /** Calcule et loggue les stats pour une zone */
+    private fun logDepthStatsForZone(zoneName: String, depthMap: FloatBuffer, width: Int, height: Int, xRange: ClosedFloatingPointRange<Float>, yRange: ClosedFloatingPointRange<Float>) {
+        var minVal = Float.MAX_VALUE; var maxVal = Float.MIN_VALUE
+        var sumVal = 0.0; var count = 0
+        val xStart = (width * xRange.start).toInt().coerceIn(0, width - 1)
+        val xEnd = (width * xRange.endInclusive).toInt().coerceIn(xStart, width)
+        val yStart = (height * yRange.start).toInt().coerceIn(0, height - 1)
+        val yEnd = (height * yRange.endInclusive).toInt().coerceIn(yStart, height)
+
+        depthMap.rewind()
+        for (y in yStart until yEnd) {
+            for (x in xStart until xEnd) {
                 val index = y * width + x
-                // Ensure index is within buffer limits before getting
                 if (index >= depthMap.limit()) continue
                 val depthValue = depthMap.get(index)
-
-                if (depthValue > obstacleClosenessThreshold) {
-                    if (depthValue > maxObstacleDepth) {
-                        maxObstacleDepth = depthValue
-                    }
-                    outObstacleCoords.add(Pair(x, y))
+                if (depthValue.isFinite() && depthValue > 0) {
+                    if (depthValue < minVal) minVal = depthValue
+                    if (depthValue > maxVal) maxVal = depthValue
+                    sumVal += depthValue
+                    count++
                 }
+            }
+        }
+        if (count > 0) {
+            val avgVal = sumVal / count
+            Log.d(DEBUG_TAG, "$zoneName Stats - Min: %.2f, Max: %.2f, Avg: %.2f (#Pts: $count)".format(minVal, maxVal, avgVal))
+        } else {
+            Log.d(DEBUG_TAG, "$zoneName Stats - No valid points.")
+        }
+    }
+
+    /** Détecte obstacles et collecte coordonnées */
+    fun detectObstaclesAndGetCoords(
+        depthMap: FloatBuffer, width: Int, height: Int,
+        outObstacleCoords: MutableList<Pair<Int, Int>>
+    ): Float {
+        var maxObstacleDepth = 0.0f
+        outObstacleCoords.clear(); depthMap.rewind()
+        val threshold = Config.OBSTACLE_CLOSENESS_THRESHOLD
+        val numPixels = width * height
+        for (i in 0 until numPixels) {
+            val depthValue = depthMap.get(i)
+            if (depthValue > threshold) {
+                if (depthValue > maxObstacleDepth) maxObstacleDepth = depthValue
+                outObstacleCoords.add(Pair(i % width, i / width))
             }
         }
         return maxObstacleDepth
     }
 
-
-    /** Calls the native RANSAC implementation. */
+    /** Appelle NDK RANSAC */
     fun detectWalls(depthMap: FloatBuffer, width: Int, height: Int): Array<FloatArray>? {
-        // Log.d(TAG, "Calling NDK RANSAC with Intrinsics (PLACEHOLDERS!) and Params...") // Can be verbose
-        val planes = NdkBridge.detectWallsRansac(
-            depthMap, width, height,
-            DEFAULT_FX, DEFAULT_FY, DEFAULT_CX, DEFAULT_CY, // Use PLACEHOLDER intrinsics
-            RANSAC_DISTANCE_THRESHOLD, RANSAC_MIN_INLIERS, RANSAC_MAX_ITERATIONS
-        )
-        // Log results for debugging if needed
-        // if (planes != null && planes.isNotEmpty()) {
-        //     Log.d(TAG, "NDK RANSAC returned ${planes.size} plane(s).")
-        //     // Log plane details...
-        // } else {
-        //     Log.d(TAG, "NDK RANSAC returned null or empty.")
-        // }
-        return planes
+        return try {
+            NdkBridge.detectWallsRansac(
+                depthMap, width, height, Config.CAMERA_FX, Config.CAMERA_FY, Config.CAMERA_CX, Config.CAMERA_CY,
+                Config.RANSAC_DISTANCE_THRESHOLD, Config.RANSAC_MIN_INLIERS, Config.RANSAC_MAX_ITERATIONS
+            )
+        } catch (e: Exception) { Log.e(TAG, "Erreur NDK detectWallsRansac", e); null }
     }
 
-    /** Interprets RANSAC results to identify walls based on normal vector orientation. */
-    fun identifyWalls(detectedPlanes: Array<FloatArray>?): Boolean {
-        if (detectedPlanes == null || detectedPlanes.isEmpty()) {
-            return false
-        }
-        val plane = detectedPlanes[0]
-        if (plane.size < 5) {
-            Log.w(TAG, "Detected plane array has unexpected size: ${plane.size}")
-            return false
-        }
-        val a = plane[0]; val b = plane[1]; val c = plane[2]
-        val normalLengthXY = sqrt(a * a + b * b)
-        if (normalLengthXY < 1e-6) { // Avoid division by zero, normal is mostly vertical
-            return false
-        }
-        val normalLengthZ = abs(c)
-        return (normalLengthZ / normalLengthXY) < WALL_NORMAL_VERTICALITY_THRESHOLD
+    /** Identifie mur depuis normale */
+    private fun identifyWallFromNormal(nx: Float, ny: Float, nz: Float): Boolean {
+        val normalLengthXY = sqrt(nx * nx + ny * ny); if (normalLengthXY < 1e-6) return false
+        return (abs(nz) / normalLengthXY) < Config.WALL_NORMAL_VERTICALITY_THRESHOLD
     }
 
-    // Enum for free path result
-    enum class FreePathResult { LEFT, CENTER, RIGHT, BLOCKED, UNKNOWN }
+    /** Estime direction mur */
+    private fun estimateWallDirection(nx: Float, ny: Float): WallDirection {
+        val angleThreshold = 0.3f
+        return when {
+            nx < -angleThreshold -> WallDirection.RIGHT
+            nx > angleThreshold -> WallDirection.LEFT
+            else -> WallDirection.FRONT
+        }
+    }
 
-    /**
-     * Estimates free path direction based on ROI analysis AND collects "far" pixel coordinates.
-     * @param depthMap Dequantized depth map FloatBuffer (position 0).
-     * @param width Depth map width.
-     * @param height Depth map height.
-     * @param outFreePathCoords Mutable list to be populated with (x, y) coords of free path pixels in ROI.
-     * @return FreePathResult enum indicating estimated direction.
-     */
+    /** Estime chemin libre et collecte coordonnées */
+    // La signature de retour utilise maintenant le type interne AnalysisManager.FreePathResult
     fun estimateFreePathAndGetCoords(
-        depthMap: FloatBuffer,
-        width: Int,
-        height: Int,
-        outFreePathCoords: MutableList<Pair<Int, Int>> // Output list
-    ): FreePathResult {
-        outFreePathCoords.clear()
-        depthMap.rewind()
+        depthMap: FloatBuffer, width: Int, height: Int,
+        outFreePathCoords: MutableList<Pair<Int, Int>>
+    ): AnalysisManager.FreePathResult { // <<< TYPE DE RETOUR COMPLET
+        outFreePathCoords.clear(); depthMap.rewind()
 
-        // --- ROI Definition ---
-        val roiYStart = height / 2
-        val roiYEnd = height
-        val roiXWidth = (width * FREE_PATH_ROI_WIDTH_FRACTION).toInt()
-        val roiXStart = (width - roiXWidth) / 2
-        val roiXEnd = roiXStart + roiXWidth
-
-        // --- Column Analysis ---
-        val leftColEnd = roiXStart + roiXWidth / 3
-        val centerColEnd = roiXStart + 2 * roiXWidth / 3
-        var farPixelsLeft = 0
-        var farPixelsCenter = 0
-        var farPixelsRight = 0
+        val roiYStart = height / 2; val roiYEnd = height
+        val roiXWidth = (width * Config.FREE_PATH_ROI_WIDTH_FRACTION).toInt()
+        val roiXStart = (width - roiXWidth) / 2; val roiXEnd = roiXStart + roiXWidth
+        val leftColEnd = roiXStart + roiXWidth / 3; val centerColEnd = roiXStart + 2 * roiXWidth / 3
+        var farPixelsLeft = 0; var farPixelsCenter = 0; var farPixelsRight = 0
         var totalPixelsInRoi = 0
+        val threshold = Config.FREE_PATH_FARNESS_THRESHOLD
 
+        // --- CORRIGER LA LIGNE SUIVANTE ---
         for (y in roiYStart until roiYEnd) {
+            // Utiliser les variables définies : roiXStart et roiXEnd
             for (x in roiXStart until roiXEnd) {
+                // --- FIN CORRECTION ---
                 totalPixelsInRoi++
                 val index = y * width + x
                 if (index >= depthMap.limit()) continue
                 val depthValue = depthMap.get(index)
-
-                // Lower inverse depth = farther away
-                if (depthValue < FREE_PATH_FARNESS_THRESHOLD) {
+                if (depthValue < threshold) {
                     outFreePathCoords.add(Pair(x, y))
                     when {
                         x < leftColEnd -> farPixelsLeft++
@@ -282,17 +217,17 @@ class AnalysisManager {
             }
         }
 
-        // --- Determine Result ---
         val totalFarPixels = farPixelsLeft + farPixelsCenter + farPixelsRight
-        if (totalPixelsInRoi == 0 || totalFarPixels < totalPixelsInRoi * FREE_PATH_BLOCKED_THRESHOLD_FRACTION) {
-            return FreePathResult.BLOCKED
+        if (totalPixelsInRoi == 0 || totalFarPixels < totalPixelsInRoi * Config.FREE_PATH_BLOCKED_THRESHOLD_FRACTION) {
+            // Utiliser le nom complet car on est DANS la classe AnalysisManager
+            return AnalysisManager.FreePathResult.BLOCKED
         }
 
         return when {
-            farPixelsCenter >= farPixelsLeft && farPixelsCenter >= farPixelsRight -> FreePathResult.CENTER
-            farPixelsLeft >= farPixelsCenter && farPixelsLeft >= farPixelsRight -> FreePathResult.LEFT
-            else -> FreePathResult.RIGHT
+            farPixelsCenter >= farPixelsLeft && farPixelsCenter >= farPixelsRight -> AnalysisManager.FreePathResult.CENTER
+            farPixelsLeft >= farPixelsCenter && farPixelsLeft >= farPixelsRight -> AnalysisManager.FreePathResult.LEFT
+            else -> AnalysisManager.FreePathResult.RIGHT
         }
     }
 
-} // End of AnalysisManager class
+} // Fin de la classe AnalysisManager

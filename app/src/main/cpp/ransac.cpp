@@ -52,8 +52,8 @@ Plane calculatePlane(const Point3D& p1, const Point3D& p2, const Point3D& p3) {
         plane.c /= length;
     } else {
         // Points are collinear or coincident, cannot form a unique plane.
-        __android_log_print(ANDROID_LOG_WARN, TAG_RANSAC, "calculatePlane: Points are collinear or coincident, cannot form plane.");
-        return {NAN, NAN, NAN, NAN}; // Indicate failure using NaN
+        //__android_log_print(ANDROID_LOG_WARN, TAG_RANSAC, "");
+        //return {NAN, NAN, NAN, NAN}; // Indicate failure using NaN
     }
 
     // Calculate D using the normalized normal and one point (p1)

@@ -15,9 +15,12 @@ plugins {
     // Add other plugins if needed, e.g., for dependency injection or navigation
 }
 
+
+
+
 android {
     namespace = "com.example.depthperceptionapp" // Replace with your actual package name
-    compileSdk = 34 // Use a recent SDK version
+    compileSdk = 35 // Use a recent SDK version
 
     defaultConfig {
         applicationId = "com.example.depthperceptionapp" // Replace if needed
@@ -75,10 +78,11 @@ android {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
-    kotlinOptions {
+    //kotlinOptions {
         // Set the target JVM version for Kotlin code
-        jvmTarget = "1.8"
-    }
+        //jvmTarget = "1.8"
+
+    //}
 
     // Enable View Binding (or Data Binding) for easier view access
     // Alternatives include Kotlin synthetic properties (deprecated) or findViewById.
@@ -104,6 +108,9 @@ android {
     aaptOptions {
         noCompress += "tflite"
     }
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
 
     // Packaging options might be needed if native libraries cause conflicts
     // packagingOptions {
@@ -117,7 +124,8 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.0") // Kotlin extensions for core Android features
     implementation("androidx.appcompat:appcompat:1.6.1") // Backward compatibility for UI features
     implementation("com.google.android.material:material:1.11.0") // Material Design components
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4") // Layout manager
+    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation(libs.androidx.core.ktx) // Layout manager
 
     // --- CameraX Libraries ---
     // CameraX provides a simplified and lifecycle-aware API for camera operations.
@@ -163,5 +171,17 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 
+    implementation(project(":opencv"))
 
+
+
+}
+
+// Configuration explicite pour toutes les tâches de compilation Kotlin dans ce module
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    kotlinOptions {
+        jvmTarget = "1.8" // <- Définir la cible JVM ici
+        // Vous pouvez ajouter d'autres options du compilateur Kotlin ici si besoin
+        // freeCompilerArgs += "-Xopt-in=kotlin.RequiresOptIn"
+    }
 }

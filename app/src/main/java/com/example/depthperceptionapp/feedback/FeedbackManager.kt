@@ -1,281 +1,337 @@
 package com.example.depthperceptionapp.feedback
+// Adaptez si nécessaire
 
 import android.content.Context
-import android.os.Build
+import android.content.res.Resources // Import pour catch Resources.NotFoundException
+import android.media.AudioAttributes
+import android.media.SoundPool
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
-import com.example.depthperceptionapp.analysis.AnalysisManager // For FreePathResult enum
+import com.example.depthperceptionapp.Config // Import Config OK
+import com.example.depthperceptionapp.R     // Import R OK
 import com.example.depthperceptionapp.analysis.DetectionState
-import java.util.Locale // Required for setting TTS language
-import java.util.UUID   // Can be used for utterance IDs
+// Importer les enums depuis leur définition unique
+import com.example.depthperceptionapp.analysis.AnalysisManager // Pour accéder à FreePathResult interne
+import com.example.depthperceptionapp.analysis.WallDirection
+import java.util.Locale
+import java.util.UUID
 
 /**
- * Manages Text-To-Speech (TTS) feedback for the application.
- *
- * Handles:
- * - Initializing the Android TTS engine.
- * - Setting the desired language (with fallback).
- * - Generating concise audio messages based on the `DetectionState`.
- * - Speaking the messages using the TTS engine.
- * - Throttling feedback to avoid overwhelming the user.
- * - Releasing TTS resources on shutdown.
- *
- * @param context Application context required for TTS initialization.
+ * Gère les retours audio multimodaux (Earcons via SoundPool, TTS) pour l'utilisateur.
+ * VERSION AMÉLIORÉE : Détecte les changements significatifs et applique hystérésis/throttling.
  */
-class FeedbackManager(context: Context) : TextToSpeech.OnInitListener {
+class FeedbackManager(private val context: Context) : TextToSpeech.OnInitListener {
 
     companion object {
         private const val TAG = "FeedbackManager"
-        // Utterance ID prefix for tracking speech events (optional)
-        private const val UTTERANCE_ID_PREFIX = "depth_feedback_"
+        private const val TTS_UTTERANCE_ID_PREFIX = "myway_tts_"
     }
 
+    // --- TTS ---
     private var tts: TextToSpeech? = null
     private var isTtsInitialized = false
-    private var selectedLanguage: Locale = Locale.US // Default to US English
+    private var selectedLanguage: Locale = Locale.CANADA_FRENCH
+    private var fallbackLanguage: Locale = Locale.FRENCH
+    private var finalFallbackLanguage: Locale = Locale.US
 
-    // State for throttling feedback
-    private var lastSpokenStateSummary: String? = null // Store a summary of the last spoken message
-    private var lastSpokenTimeMs: Long = 0
-    // TUNABLE: Minimum time in milliseconds between consecutive spoken feedbacks,
-    // unless the state changes significantly. Prevents chatter. Tune for user comfort.
-    private val throttleMillis = 1500L // Speak at most about every 1.5 seconds
+    // --- SoundPool ---
+    private var soundPool: SoundPool? = null
+    private var isSoundPoolLoaded = false
+    private var obstacleSoundId: Int = -1
+    private var wallSoundId: Int = -1
+    private var pathClearSoundId: Int = -1
+    private var errorSoundId: Int = -1
+    // Streams actifs
+    private var currentObstacleStreamId: Int? = null
+    private var currentWallStreamId: Int? = null
+    private var currentPathStreamId: Int? = null
 
-    // TUNABLE: Speech parameters (adjust in onInit or dynamically)
-    private var speechRate = 1.0f // 1.0 is normal speed
-    private var speechPitch = 1.0f // 1.0 is normal pitch
+    // --- Throttling & State ---
+    private var lastObstacleReportTime: Long = 0
+    private var lastWallReportTime: Long = 0
+    private var lastPathReportTime: Long = 0
+    private var lastProcessedState: DetectionState? = null
+    private var isObstacleAlertActive: Boolean = false
 
     init {
-        Log.d(TAG, "Initializing FeedbackManager...")
+        Log.d(TAG, "Initialisation FeedbackManager v2...")
         try {
-            // Start TTS engine initialization. The result is delivered asynchronously
-            // to the onInit callback method.
             tts = TextToSpeech(context, this)
-            Log.d(TAG, "TTS instance created, waiting for initialization...")
+        } catch (e: Exception) { Log.e(TAG, "Erreur création instance TTS", e) }
+        setupSoundPool()
+    }
+
+    // --- Configuration SoundPool ---
+    private fun setupSoundPool() {
+        Log.d(TAG, "Configuration SoundPool...")
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+
+        soundPool = SoundPool.Builder()
+            .setAudioAttributes(audioAttributes)
+            .setMaxStreams(Config.SOUNDPOOL_MAX_STREAMS) // Utilise Config
+            .build()
+
+        soundPool?.setOnLoadCompleteListener { _, sampleId, status ->
+            if (status == 0) {
+                Log.i(TAG, "Son chargé: ID $sampleId")
+                checkSoundPoolLoaded()
+            } else {
+                Log.e(TAG, "Erreur chargement son ID: $sampleId, Status: $status")
+                isSoundPoolLoaded = false
+            }
+        }
+
+        try {
+            // Charger les sons depuis res/raw en utilisant les bons identifiants R.raw.*
+            // (qui doivent correspondre aux noms de fichiers renommés SANS extension)
+            obstacleSoundId = soundPool?.load(context, R.raw.obstaclenear, 1) ?: -1
+            wallSoundId = soundPool?.load(context, R.raw.walldetected, 1) ?: -1
+            pathClearSoundId = soundPool?.load(context, R.raw.pathclear, 1) ?: -1
+            errorSoundId = soundPool?.load(context, R.raw.errorbeep, 1) ?: -1
+
+            if (listOf(obstacleSoundId, wallSoundId, pathClearSoundId, errorSoundId).any { it <= 0 }) {
+                Log.e(TAG, "Au moins un son n'a pas pu être initié au chargement (ID invalide retourné par load).")
+                isSoundPoolLoaded = false
+            } else {
+                Log.d(TAG, "Chargement des sons initié (IDs: Obs=$obstacleSoundId, Wall=$wallSoundId, Path=$pathClearSoundId, Err=$errorSoundId).")
+            }
+        } catch (e: Resources.NotFoundException) {
+            // Cette erreur se produira si R.raw.* n'est pas généré (fichier manquant OU build non nettoyé)
+            Log.e(TAG, "Erreur Ressources.NotFoundException lors de soundPool.load(). Vérifiez que les fichiers existent dans res/raw avec les bons noms (ex: obstacle_near.wav) ET que le projet est nettoyé/reconstruit.", e)
+            isSoundPoolLoaded = false; soundPool?.release(); soundPool = null
         } catch (e: Exception) {
-            Log.e(TAG, "Exception creating TextToSpeech instance: ${e.message}", e)
-            // Handle failure: TTS might not be available on the device.
-            tts = null
+            Log.e(TAG, "Erreur générique lors de soundPool.load()", e)
+            isSoundPoolLoaded = false; soundPool?.release(); soundPool = null
         }
     }
 
-    /**
-     * Callback invoked when the TTS engine finishes initialization.
-     *
-     * @param status Indicates TTS initialization status (TextToSpeech.SUCCESS or TextToSpeech.ERROR).
-     */
+    private fun checkSoundPoolLoaded() {
+        if (obstacleSoundId > 0 && wallSoundId > 0 && pathClearSoundId > 0 && errorSoundId > 0) {
+            if (!isSoundPoolLoaded) {
+                isSoundPoolLoaded = true
+                Log.i(TAG, "SoundPool prêt !")
+            }
+        }
+    }
+
+    // --- Callback Initialisation TTS ---
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            Log.i(TAG, "TTS Initialization successful.")
+            Log.i(TAG, "Initialisation TTS réussie.")
+            val langResult = tts?.setLanguage(selectedLanguage) // FR_CA
+            if (isLanguageNotAvailable(langResult)) {
+                Log.w(TAG, "Langue TTS '${selectedLanguage.displayLanguage}' non supportée. Essai '${fallbackLanguage.displayLanguage}'.")
+                val fallbackResult = tts?.setLanguage(fallbackLanguage) // FR
+                if (isLanguageNotAvailable(fallbackResult)) {
+                    Log.w(TAG, "Langue TTS '${fallbackLanguage.displayLanguage}' non supportée. Essai '${finalFallbackLanguage.displayLanguage}'.")
+                    val finalFallbackResult = tts?.setLanguage(finalFallbackLanguage) // US
+                    if (isLanguageNotAvailable(finalFallbackResult)) {
+                        Log.e(TAG, "Langue TTS finale fallback '${finalFallbackLanguage.displayLanguage}' non supportée ! TTS désactivé.")
+                        isTtsInitialized = false; tts?.shutdown(); tts = null; return
+                    } else { Log.i(TAG,"Langue TTS réglée sur fallback final: ${finalFallbackLanguage.displayLanguage}") }
+                } else { Log.i(TAG,"Langue TTS réglée sur fallback: ${fallbackLanguage.displayLanguage}") }
+            } else { Log.i(TAG, "Langue TTS réglée sur : ${selectedLanguage.displayLanguage}") }
 
-            // --- Language Selection ---
-            // Try setting the preferred language (e.g., French for Montreal, Canada)
-            // Use Locale.CANADA_FRENCH for Canadian French. Locale.FRANCE for French (France).
-            // Locale.US for US English (widely supported fallback).
-            val preferredLanguage = Locale.CANADA_FRENCH // Target for Montreal
-            val fallbackLanguage = Locale.US
-
-            val langResult = tts?.setLanguage(preferredLanguage)
-
-            if (langResult == TextToSpeech.LANG_MISSING_DATA || langResult == TextToSpeech.LANG_NOT_SUPPORTED) {
-                Log.w(TAG, "TTS language '${preferredLanguage.displayLanguage}' (e.g., Canadian French) is not supported or missing data. Trying fallback '${fallbackLanguage.displayLanguage}'.")
-                // Attempt to set a fallback language (e.g., US English)
-                val fallbackResult = tts?.setLanguage(fallbackLanguage)
-                if (fallbackResult == TextToSpeech.LANG_MISSING_DATA || fallbackResult == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    Log.e(TAG, "TTS fallback language '${fallbackLanguage.displayLanguage}' is also not supported or missing data. TTS disabled.")
-                    // Handle error: TTS is unusable. Maybe notify the user?
-                    isTtsInitialized = false
-                    tts = null // Release the potentially unusable instance
-                    return
-                } else {
-                    Log.i(TAG, "TTS language set to fallback: ${fallbackLanguage.displayLanguage}")
-                    selectedLanguage = fallbackLanguage
-                }
-            } else {
-                Log.i(TAG, "TTS language set to preferred: ${preferredLanguage.displayLanguage}")
-                selectedLanguage = preferredLanguage
-            }
-
-            // --- Set Speech Parameters ---
-            // Adjust speech rate and pitch (TUNABLE)
-            tts?.setSpeechRate(speechRate)
-            tts?.setPitch(speechPitch)
-            Log.i(TAG, "TTS speech rate: $speechRate, pitch: $speechPitch")
-
-
-            // --- Set Utterance Progress Listener (Optional but recommended) ---
-            // Provides callbacks for when speech starts, finishes, or errors.
-            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    // Log.d(TAG, "TTS Start: $utteranceId") // Can be verbose
-                }
-
-                override fun onDone(utteranceId: String?) {
-                    // Log.d(TAG, "TTS Done: $utteranceId") // Can be verbose
-                }
-
-                // This might be deprecated; onError(CharSequence, Exception) might be preferred on newer APIs
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    Log.e(TAG, "TTS Error (Deprecated Listener): $utteranceId")
-                }
-
-                override fun onError(utteranceId: String?, errorCode: Int) {
-                    Log.e(TAG, "TTS Error: $utteranceId, Code: $errorCode")
-                    // Handle errors like network timeout if using network synthesis, output issues, etc.
-                }
-            })
-
+            tts?.setSpeechRate(Config.TTS_DEFAULT_SPEECH_RATE) // Utilise Config
+            tts?.setPitch(Config.TTS_DEFAULT_PITCH) // Utilise Config
+            tts?.setOnUtteranceProgressListener(ttsProgressListener)
             isTtsInitialized = true
-            Log.i(TAG, "TTS setup complete and ready.")
-            // Speak a confirmation message (optional)
-            // tts?.speak("Guidance system ready.", TextToSpeech.QUEUE_FLUSH, null, "init_complete")
-
+            Log.i(TAG, "TTS prêt.")
         } else {
-            // TTS Initialization failed at the engine level.
-            Log.e(TAG, "TTS Initialization failed! Status code: $status")
-            isTtsInitialized = false
-            tts = null
+            Log.e(TAG, "Échec de l'initialisation TTS ! Status: $status")
+            isTtsInitialized = false; tts = null
         }
     }
 
-    /**
-     * Generates and speaks audio feedback based on the current detection state,
-     * applying throttling to avoid overwhelming the user with constant updates.
-     *
-     * @param currentState The latest DetectionState from the AnalysisManager.
-     */
+    /** Listener pour les événements TTS */
+    private val ttsProgressListener = object : UtteranceProgressListener() {
+        override fun onStart(utteranceId: String?) {}
+        override fun onDone(utteranceId: String?) {}
+        @Deprecated("Deprecated in Java")
+        override fun onError(utteranceId: String?) { Log.e(TAG, "TTS Error (Deprecated): $utteranceId") }
+        override fun onError(utteranceId: String?, errorCode: Int) { Log.e(TAG, "TTS Error: $utteranceId, Code=$errorCode") }
+    }
+
+    /** Vérifie si le code de retour de setLanguage indique une erreur */
+    private fun isLanguageNotAvailable(result: Int?): Boolean {
+        return result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED
+    }
+
+    // --- Méthode Principale appelée par DepthAnalyzer ---
     fun provideFeedback(currentState: DetectionState) {
-        // Check if TTS is initialized and ready.
-        if (!isTtsInitialized || tts == null) {
-            // Log.w(TAG, "TTS not ready, skipping feedback.") // Can be noisy
-            return
+        if (!isTtsInitialized || !isSoundPoolLoaded || soundPool == null) {
+            return // Ne rien faire si audio pas prêt
         }
-
-        // --- Generate Message ---
-        // Create a concise text message based on the detected state.
-        val message = generateFeedbackMessage(currentState)
-        // Create a summary of the message for throttling comparison.
-        val currentSummary = message // Use the full message for summary in this simple case
-
-        // --- Apply Throttling ---
-        val currentTimeMs = System.currentTimeMillis()
-        // Determine if the core message has changed significantly from the last spoken one.
-        // Or if enough time has passed since the last spoken feedback.
-        val shouldSpeak = (currentSummary != lastSpokenStateSummary && currentSummary.isNotBlank()) ||
-                (currentTimeMs - lastSpokenTimeMs > throttleMillis)
-
-        if (shouldSpeak && currentSummary.isNotBlank()) {
-            // --- Speak Message ---
-            // Use QUEUE_FLUSH to interrupt any ongoing speech and speak the new message immediately.
-            // Use QUEUE_ADD to queue messages if needed, but flush is better for real-time updates.
-            // utteranceId can be used to track progress via UtteranceProgressListener.
-            val utteranceId = UTTERANCE_ID_PREFIX + UUID.randomUUID().toString()
-
-            // Pass parameters bundle if needed (e.g., volume, stream type)
-            val params = Bundle()
-            // params.putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f) // Example: Set volume
-            // params.putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_ALARM) // Example: Speak on Alarm stream
-
-            Log.i(TAG, "Speaking (ID: $utteranceId): '$message'")
-            tts?.speak(message, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-
-            // Update throttling state
-            lastSpokenStateSummary = currentSummary
-            lastSpokenTimeMs = currentTimeMs
-        } else {
-            // Feedback throttled or message is blank
-            // Log.d(TAG, "Feedback throttled or message blank.") // Can be verbose
-        }
+        determineAndPlayFeedback(currentState)
+        lastProcessedState = currentState // Mémoriser pour prochaine comparaison
     }
 
+    // --- Logique de Décision et de Jeu ---
+    private fun determineAndPlayFeedback(currentState: DetectionState) {
+        val currentTime = System.currentTimeMillis()
+        val lastState = lastProcessedState
+        var feedbackPlayedThisFrame = false // Pour gérer la priorité
 
-    /**
-     * Helper function to generate a concise, prioritized feedback message from the DetectionState.
-     * Prioritizes immediate obstacles, then walls, then the general free path.
-     *
-     * @param state The current DetectionState.
-     * @return A String containing the message to be spoken, or an empty string if nothing significant is detected.
-     */
-    private fun generateFeedbackMessage(state: DetectionState): String {
-        val messages = mutableListOf<String>()
+        // --- Priorité 1 : Obstacle Proche ---
+        val isNowAboveThreshold = currentState.maxObstacleDepth > Config.OBSTACLE_CLOSENESS_THRESHOLD
+        val wasAlreadyAlerting = isObstacleAlertActive
+        val isNowBelowHysteresis = currentState.maxObstacleDepth < (Config.OBSTACLE_CLOSENESS_THRESHOLD * Config.OBSTACLE_HYSTERESIS_FACTOR)
+        val significantIncrease = lastState != null &&
+                (currentState.maxObstacleDepth - lastState.maxObstacleDepth > Config.OBSTACLE_SIGNIFICANT_DELTA_DEPTH)
 
-        // --- 1. Prioritize Immediate Obstacles ---
-        // Use the same threshold as defined/used in AnalysisManager for consistency.
-        // TODO: Consider getting threshold from AnalysisManager if it becomes dynamic.
-        val obstacleThreshold = 0.8f // Needs tuning (higher = closer)
-        if (state.maxObstacleDepth > obstacleThreshold) {
-            // Use concise language. "Obstacle" is general. Future phases could use object detection results.
-            // Consider adding relative direction if available (e.g., "Obstacle close center").
-            messages.add(translate("Obstacle close ahead.", "Obstacle proche devant."))
-            // If an obstacle is close, often that's the most critical info, so we might stop here.
-            return messages.first() // Return immediately for critical obstacle
-        }
-
-        // --- 2. Report Detected Walls (If No Close Obstacle) ---
-        if (state.wallDetected) {
-            // TODO: Future: Could add direction (e.g., "Wall Left", "Wall Right") if analyzed by AnalysisManager.
-            messages.add(translate("Wall detected.", "Mur détecté."))
-            // We could potentially return here too, as walls are significant.
-            // return messages.first() // Optionally return after detecting a wall
-        }
-
-        // --- 3. Report Free Path (If No Close Obstacle or Wall info is less critical) ---
-        // Only report free path if no immediate obstacle was the primary message.
-        // Decide if wall message should also suppress free path message (depends on user need).
-        // Current logic: Reports free path even if wall detected, unless obstacle was close.
-        when (state.freePathDirection) {
-            AnalysisManager.FreePathResult.CENTER -> messages.add(translate("Path clear center.", "Chemin libre au centre."))
-            AnalysisManager.FreePathResult.LEFT -> messages.add(translate("Path clear left.", "Chemin libre à gauche."))
-            AnalysisManager.FreePathResult.RIGHT -> messages.add(translate("Path clear right.", "Chemin libre à droite."))
-            AnalysisManager.FreePathResult.BLOCKED -> messages.add(translate("Path blocked.", "Chemin bloqué."))
-            AnalysisManager.FreePathResult.UNKNOWN -> { /* No path info determined */ }
-        }
-
-        // Combine messages concisely or just speak the most important one found.
-        // Current logic returns the first message added (Obstacle > Wall > Path).
-        // Alternative: join messages (e.g., "Wall detected. Path clear center.") - potentially too verbose.
-        return messages.firstOrNull() ?: "" // Return the highest priority message, or empty string
-    }
-
-    /**
-     * Simple placeholder for translation based on selected TTS language.
-     * In a real app, use Android String resources with locale qualifiers.
-     */
-    private fun translate(english: String, french: String): String {
-        return if (selectedLanguage.language == Locale.FRENCH.language) {
-            french
-        } else {
-            english
-        }
-    }
-
-
-    /**
-     * Shuts down the TTS engine and releases its resources.
-     * Should be called when the TTS service is no longer needed, typically in `onDestroy`
-     * of the Activity/Service that owns this FeedbackManager.
-     */
-    fun shutdown() {
-        Log.d(TAG, "Shutting down TTS engine...")
-        if (tts != null) {
-            try {
-                // Stop any ongoing speech immediately.
-                tts?.stop()
-                // Release the TTS engine resources.
-                tts?.shutdown()
-                Log.i(TAG, "TTS engine stopped and shut down.")
-            } catch (e: Exception) {
-                Log.e(TAG, "Exception during TTS shutdown: ${e.message}", e)
-            } finally {
-                isTtsInitialized = false
-                tts = null
+        // Déclencher / Redéclencher alerte obstacle
+        if (isNowAboveThreshold && (!wasAlreadyAlerting || significantIncrease)) {
+            isObstacleAlertActive = true
+            if (currentTime - lastObstacleReportTime > Config.MIN_DELAY_OBSTACLE_ALERT_MS) {
+                stopLowerPrioritySounds()
+                val rate = calculateObstacleRate(currentState.maxObstacleDepth)
+                currentObstacleStreamId = playEarcon(obstacleSoundId, rate = rate)
+                speakTTS(translateForTTS("Obstacle proche !"), TextToSpeech.QUEUE_FLUSH, "obstacle")
+                lastObstacleReportTime = currentTime
+                feedbackPlayedThisFrame = true
             }
-        } else {
-            Log.d(TAG, "TTS engine was already null.")
+        }
+        // Arrêter l'alerte obstacle
+        else if (wasAlreadyAlerting && isNowBelowHysteresis) {
+            Log.d(TAG, "Obstacle cleared")
+            isObstacleAlertActive = false
+            stopSound(currentObstacleStreamId); currentObstacleStreamId = null
+        }
+
+        if (feedbackPlayedThisFrame) return // Priorité haute, on s'arrête là pour cette frame
+
+        // --- Priorité 2 : Mur Détecté ---
+        val isNowWall = currentState.wallDetected
+        val wasWall = lastState?.wallDetected ?: false
+        val wallDirectionChanged = wasWall && isNowWall && currentState.wallDirection != lastState?.wallDirection && currentState.wallDirection != WallDirection.NONE
+
+        if (isNowWall && (!wasWall || wallDirectionChanged)) {
+            if (currentTime - lastWallReportTime > Config.MIN_DELAY_WALL_ALERT_MS) {
+                stopSound(currentPathStreamId); currentPathStreamId = null
+
+                var leftVol = Config.SPATIALIZATION_HIGH_VOLUME; var rightVol = Config.SPATIALIZATION_HIGH_VOLUME
+                val ttsMessage = when (currentState.wallDirection) {
+                    WallDirection.LEFT -> { leftVol = Config.SPATIALIZATION_HIGH_VOLUME; rightVol = Config.SPATIALIZATION_LOW_VOLUME; "Mur à gauche." }
+                    WallDirection.RIGHT -> { leftVol = Config.SPATIALIZATION_LOW_VOLUME; rightVol = Config.SPATIALIZATION_HIGH_VOLUME; "Mur à droite." }
+                    WallDirection.FRONT -> "Mur devant."
+                    WallDirection.NONE -> "Mur détecté."
+                }
+
+                currentWallStreamId = playEarcon(wallSoundId, leftVolume = leftVol, rightVolume = rightVol)
+                speakTTS(translateForTTS(ttsMessage), TextToSpeech.QUEUE_ADD, "wall_${currentState.wallDirection}")
+                lastWallReportTime = currentTime
+                feedbackPlayedThisFrame = true
+            }
+        }
+
+        // --- Priorité 3 : Changement État Chemin Libre ---
+        // Utiliser AnalysisManager.FreePathResult car enum est défini dans cette classe
+        val currentPath = currentState.freePathDirection
+        val lastPath = lastState?.freePathDirection ?: AnalysisManager.FreePathResult.UNKNOWN
+        val pathStateChanged = currentPath != lastPath
+        val isNowClearPath = currentPath == AnalysisManager.FreePathResult.LEFT ||
+                currentPath == AnalysisManager.FreePathResult.CENTER ||
+                currentPath == AnalysisManager.FreePathResult.RIGHT
+
+        // Alerter seulement si l'état change ET devient "clair"
+        if (pathStateChanged && isNowClearPath) {
+            if (currentTime - lastPathReportTime > Config.MIN_DELAY_PATH_ALERT_MS) {
+                val ttsMessage = when(currentPath) {
+                    AnalysisManager.FreePathResult.CENTER -> "Chemin libre centre."
+                    AnalysisManager.FreePathResult.LEFT -> "Chemin libre à gauche."
+                    AnalysisManager.FreePathResult.RIGHT -> "Chemin libre à droite."
+                    else -> ""
+                }
+                if (ttsMessage.isNotEmpty()){
+                    currentPathStreamId = playEarcon(pathClearSoundId)
+                    speakTTS(translateForTTS(ttsMessage), TextToSpeech.QUEUE_ADD, "path_clear_${currentPath}")
+                    lastPathReportTime = currentTime
+                }
+            }
+        }
+        // Gérer le cas BLOCKED si changement
+        else if (pathStateChanged && currentPath == AnalysisManager.FreePathResult.BLOCKED) {
+            Log.d(TAG, "Path became BLOCKED.")
+            // Optionnel: jouer son error_beep ou TTS "Chemin bloqué" (avec throttling)
+            // if (currentTime - lastPathReportTime > Config.MIN_DELAY_PATH_ALERT_MS) { ... playEarcon(errorSoundId)... }
+        }
+
+        // TODO: Placeholder pour future intégration IMU
+    }
+
+    /** Calcule le taux de lecture/pitch pour le son d'obstacle */
+    private fun calculateObstacleRate(depthValue: Float) : Float {
+        val threshold = Config.OBSTACLE_CLOSENESS_THRESHOLD
+        val maxDepthForMaxRate = Config.OBSTACLE_MAX_DEPTH_FOR_MAX_RATE
+        val minRate = Config.OBSTACLE_SOUND_RATE_MIN
+        val maxRate = Config.OBSTACLE_SOUND_RATE_MAX
+        if (depthValue <= threshold) return minRate.coerceIn(0.5f, 2.0f) // Retourner min mais dans la plage valide
+        val range = maxDepthForMaxRate - threshold
+        val depthInRange = (depthValue - threshold).coerceIn(0f, range)
+        val ratio = if (range > 0) depthInRange / range else 1f
+        return (minRate + ratio * (maxRate - minRate)).coerceIn(0.5f, 2.0f) // Assurer plage valide
+    }
+
+    /** Joue un son chargé dans le SoundPool */
+    private fun playEarcon(soundId: Int, rate: Float = 1.0f, leftVolume: Float = 1.0f, rightVolume: Float = 1.0f): Int? {
+        if (!isSoundPoolLoaded || soundPool == null || soundId <= 0) {
+            Log.w(TAG, "SoundPool non prêt ou ID invalide ($soundId) pour playEarcon")
+            return null
+        }
+        val streamId = try {
+            soundPool?.play(soundId, leftVolume.coerceIn(0.0f, 1.0f), rightVolume.coerceIn(0.0f, 1.0f), 1, 0, rate.coerceIn(0.5f, 2.0f))
+        } catch (e: Exception) { Log.e(TAG, "Erreur SoundPool.play()", e); null }
+        if (streamId == null || streamId == 0) { Log.e(TAG, "SoundPool.play a échoué (streamId=$streamId)") }
+        return streamId
+    }
+
+    /** Arrête un stream SoundPool */
+    private fun stopSound(streamId: Int?) {
+        if (streamId != null && streamId > 0 && soundPool != null) {
+            try { soundPool?.stop(streamId) }
+            catch (e: Exception) { Log.e(TAG, "Erreur SoundPool.stop(streamId=$streamId)", e) }
         }
     }
 
-} // End of FeedbackManager class
+    /** Arrête les sons de priorité inférieure */
+    private fun stopLowerPrioritySounds() {
+        stopSound(currentWallStreamId); currentWallStreamId = null
+        stopSound(currentPathStreamId); currentPathStreamId = null
+    }
+
+    /** Fait parler le moteur TTS */
+    private fun speakTTS(text: String, queueMode: Int = TextToSpeech.QUEUE_ADD, utteranceIdSuffix: String? = null) {
+        if (!isTtsInitialized || tts == null || text.isBlank()) return
+        val utteranceId = TTS_UTTERANCE_ID_PREFIX + (utteranceIdSuffix ?: System.currentTimeMillis())
+        val params = Bundle()
+        try { tts?.speak(text, queueMode, params, utteranceId) }
+        catch (e: Exception) { Log.e(TAG, "Erreur lors de tts.speak() pour '$text'", e) }
+    }
+
+    /** "Traduit" les messages pour TTS */
+    private fun translateForTTS(englishDefault: String, frenchMsg: String? = null): String {
+        val useFrench = tts?.language?.language == Locale.FRENCH.language
+        val effectiveMsg = if (useFrench && frenchMsg != null) frenchMsg else englishDefault
+        // TODO: Remplacer par ressources strings.xml
+        return effectiveMsg
+    }
+
+    /** Libère les ressources */
+    fun shutdown() {
+        Log.d(TAG, "Arrêt de FeedbackManager...")
+        if (tts != null) {
+            try { tts?.stop(); tts?.shutdown() } catch (e: Exception) { Log.e(TAG, "Erreur arrêt TTS", e) }
+            finally { tts = null; isTtsInitialized = false }
+        }
+        if (soundPool != null) {
+            try { soundPool?.release() } catch (e: Exception) { Log.e(TAG, "Erreur release SoundPool", e) }
+            finally { soundPool = null; isSoundPoolLoaded = false }
+        }
+        Log.i(TAG, "FeedbackManager arrêté.")
+    }
+}

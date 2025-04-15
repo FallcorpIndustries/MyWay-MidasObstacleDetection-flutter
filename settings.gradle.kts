@@ -19,5 +19,10 @@ dependencyResolutionManagement {
     }
 }
 
+
+
+
 rootProject.name = "DepthPerceptionApp"
 include(":app")
+
+include(":opencv")

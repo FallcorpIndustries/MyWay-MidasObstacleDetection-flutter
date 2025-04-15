@@ -1,282 +1,259 @@
 package com.example.depthperceptionapp.ui
+// Adaptez le nom du package si nécessaire
 
 import android.Manifest
+import android.content.Intent // <<< IMPORT AJOUTÉ
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
+// import android.widget.Button // Pas nécessaire si on utilise ViewBinding directement
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import com.example.depthperceptionapp.Config // Import nécessaire pour lire seuil dans formatDebugText
+import com.example.depthperceptionapp.R // Import pour ID (si on utilisait findViewById)
 import com.example.depthperceptionapp.analysis.AnalysisManager
 import com.example.depthperceptionapp.analysis.DetectionState
-// Import VisualizationData
 import com.example.depthperceptionapp.analysis.VisualizationData
+import com.example.depthperceptionapp.analysis.WallDirection // Import pour formatDebugText
 import com.example.depthperceptionapp.camera.DepthAnalyzer
-import com.example.depthperceptionapp.databinding.ActivityCameraBinding
+import com.example.depthperceptionapp.databinding.ActivityCameraBinding // Assurez-vous que le nom correspond
 import com.example.depthperceptionapp.feedback.FeedbackManager
 import com.example.depthperceptionapp.tflite.DepthPredictor
-// Import OverlayView
 import com.example.depthperceptionapp.ui.OverlayView
-import kotlinx.coroutines.* // Import CoroutineScope
+import kotlinx.coroutines.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * Main activity hosting the camera preview, analysis pipeline, and visualization overlay.
+ * Activité principale hébergeant l'aperçu caméra, le pipeline d'analyse,
+ * le retour audio/TTS, et l'overlay de visualisation.
+ * Inclut maintenant un listener pour lancer CalibrationActivity.
  */
 class CameraActivity : AppCompatActivity() {
 
-    // View Binding instance for accessing layout views
     private lateinit var binding: ActivityCameraBinding
-    // Reference for the custom overlay view
     private lateinit var overlayView: OverlayView
-
-    // CameraX related variables
     private var cameraProvider: ProcessCameraProvider? = null
     private var previewUseCase: Preview? = null
     private var imageAnalysisUseCase: ImageAnalysis? = null
     private var cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-
-    // Executor for running ImageAnalysis on a separate background thread
     private lateinit var cameraExecutor: ExecutorService
-
-    // Components for the depth perception pipeline
     private var depthPredictor: DepthPredictor? = null
     private var analysisManager: AnalysisManager? = null
     private var feedbackManager: FeedbackManager? = null
-
-    // Coroutine scope for managing background tasks related to analysis/feedback
     private val analysisScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     companion object {
-        private const val TAG = "CameraActivity" // Tag for logging
+        private const val TAG = "CameraActivity"
     }
 
-    // Activity Result Launcher for Camera Permission Request
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
             if (isGranted) {
-                Log.i(TAG, "Camera permission granted.")
+                Log.i(TAG, "Permission Caméra accordée.")
                 setupCamera()
             } else {
-                Log.e(TAG, "Camera permission denied.")
-                Toast.makeText(
-                    this,
-                    "Camera permission is required for this app to function.",
-                    Toast.LENGTH_LONG
-                ).show()
-                // finish() // Optionally close the app if permission denied
+                Log.e(TAG, "Permission Caméra refusée.")
+                Toast.makeText(this, "La permission caméra est nécessaire.", Toast.LENGTH_LONG).show()
+                // finish()
             }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Inflate the layout using View Binding
         binding = ActivityCameraBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        Log.d(TAG, "onCreate: Initialisation...")
 
-        Log.d(TAG, "onCreate: Initializing components...")
-
-        // Get reference to the OverlayView from the binding
         overlayView = binding.overlayView
-
-        // Initialize core components
         cameraExecutor = Executors.newSingleThreadExecutor()
 
         try {
-            // Initialize components (ensure DepthPredictor handles init errors)
             depthPredictor = DepthPredictor(this)
             analysisManager = AnalysisManager()
-            feedbackManager = FeedbackManager(this)
-
+            feedbackManager = FeedbackManager(this) // Assurez-vous que FeedbackManager est prêt pour Phase 2
         } catch (e: Exception) {
-            Log.e(TAG, "Initialization Error during onCreate: ${e.message}", e)
-            Toast.makeText(this, "Failed to initialize core components: ${e.message}", Toast.LENGTH_LONG).show()
-            // Consider disabling functionality or closing the app
-            return // Exit onCreate if essential components fail
-        }
-
-        // Check for camera permission on startup
-        checkCameraPermission()
-
-        Log.d(TAG, "onCreate: Initialization complete.")
-    }
-
-    // Checks if camera permission is granted. If not, requests it.
-    private fun checkCameraPermission() {
-        when {
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) == PackageManager.PERMISSION_GRANTED -> {
-                Log.i(TAG, "Camera permission already granted.")
-                setupCamera()
-            }
-            shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) -> {
-                Log.w(TAG, "Showing permission rationale.")
-                Toast.makeText(this, "Camera access is needed to analyze the surroundings.", Toast.LENGTH_LONG).show()
-                requestPermissionLauncher.launch(Manifest.permission.CAMERA)
-            }
-            else -> {
-                Log.i(TAG, "Requesting camera permission.")
-                requestPermissionLauncher.launch(Manifest.permission.CAMERA)
-            }
-        }
-    }
-
-    // Sets up the camera provider and binds use cases
-    private fun setupCamera() {
-        // Check if predictor initialized successfully before setting up camera dependent on it
-        if (depthPredictor == null || !depthPredictor!!.isInitialized) {
-            Log.e(TAG, "Depth predictor not initialized. Cannot setup camera.")
-            Toast.makeText(this, "Model loading failed. Camera disabled.", Toast.LENGTH_LONG).show()
+            Log.e(TAG, "Erreur d'initialisation (probable modèle TFLite): ${e.message}", e)
+            Toast.makeText(this, "Erreur initialisation: ${e.message}", Toast.LENGTH_LONG).show()
             return
         }
 
-        Log.d(TAG, "Setting up camera...")
+        // --- GESTION DU CLIC SUR LE BOUTON CALIBRER ---
+        // Assurez-vous que l'ID de votre bouton dans activity_camera.xml est bien "buttonGoToCalibration"
+        // Si vous l'avez ajouté et qu'il a cet ID, ce code devrait fonctionner.
+        // Si le bouton n'existe pas dans le XML, l'accès via binding lèvera une exception (attrapée ci-dessous).
+        try {
+            // Utilisez l'ID exact défini dans votre fichier activity_camera.xml
+            // Si vous n'avez pas ajouté le bouton, cette ligne échouera (le catch le signalera).
+            binding.buttonGoToCalibration.setOnClickListener {
+                Log.i(TAG, "Clic sur le bouton Calibrer -> Lancement de CalibrationActivity...")
+                Toast.makeText(this, "Lancement Calibration...", Toast.LENGTH_SHORT).show() // Feedback immédiat
+
+                try {
+                    // Créer une Intention pour démarrer CalibrationActivity
+                    val intent = Intent(this, CalibrationActivity::class.java)
+                    // Démarrer la nouvelle activité
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    // Capturer une erreur si l'activité ne peut pas être démarrée (ex: non déclarée dans Manifest)
+                    Log.e(TAG, "Erreur lors du lancement explicite de CalibrationActivity", e)
+                    Toast.makeText(this, "Impossible de lancer l'écran de calibration: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            Log.d(TAG, "Listener ajouté pour buttonGoToCalibration.")
+        } catch (e: NullPointerException) {
+            // Ceci arrivera si 'buttonGoToCalibration' n'existe pas dans votre layout XML lié par le binding
+            Log.e(TAG, "Le bouton avec l'ID 'buttonGoToCalibration' n'a pas été trouvé dans le layout activity_camera.xml. Listener non ajouté.", e)
+            // Optionnel : Afficher un message si le bouton est censé exister
+            // Toast.makeText(this, "Erreur interne: Bouton Calibrer non trouvé dans layout.", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            // Autres erreurs possibles lors de l'ajout du listener
+            Log.e(TAG, "Erreur lors de l'ajout du listener au bouton de calibration", e)
+            Toast.makeText(this, "Erreur interne: Listener bouton calibration.", Toast.LENGTH_LONG).show()
+        }
+        // --- Fin gestion clic ---
+
+        // Vérifier la permission caméra au démarrage
+        checkCameraPermission()
+
+        Log.d(TAG, "onCreate: Initialisation terminée.")
+    }
+
+    private fun checkCameraPermission() {
+        when {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED -> {
+                Log.i(TAG, "Permission Caméra déjà accordée.")
+                setupCamera()
+            }
+            shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) -> {
+                Log.w(TAG, "Affichage de la justification pour la permission.")
+                Toast.makeText(this, "L'accès caméra est requis pour analyser l'environnement.", Toast.LENGTH_LONG).show()
+                requestPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+            else -> {
+                Log.i(TAG, "Demande de la permission caméra.")
+                requestPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+        }
+    }
+
+    private fun setupCamera() {
+        if (depthPredictor == null || !depthPredictor!!.isInitialized) {
+            Log.e(TAG, "DepthPredictor non initialisé. Impossible de configurer la caméra.")
+            Toast.makeText(this, "Échec chargement modèle. Caméra désactivée.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        Log.d(TAG, "Configuration de la caméra...")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
             try {
                 cameraProvider = cameraProviderFuture.get()
 
-                // Build Preview Use Case
-                previewUseCase = Preview.Builder()
-                    .build()
-                    .also {
-                        it.setSurfaceProvider(binding.previewView.surfaceProvider)
-                        Log.d(TAG, "Preview use case built and surface provider set.")
-                    }
+                previewUseCase = Preview.Builder().build().also {
+                    it.setSurfaceProvider(binding.previewView.surfaceProvider)
+                }
 
-                // Build ImageAnalysis Use Case
                 imageAnalysisUseCase = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(640, 480)) // Consider device capabilities
+                    .setTargetResolution(Size(640, 480))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                     .build()
                     .also {
-                        // Set the analyzer, passing the callback to handle results
                         it.setAnalyzer(cameraExecutor, DepthAnalyzer(
                             depthPredictor = depthPredictor!!,
                             analysisManager = analysisManager!!,
                             feedbackManager = feedbackManager!!,
                             analysisScope = analysisScope,
-                            // --- Updated onResult Lambda ---
-                            onResult = { visData: VisualizationData -> // Receives VisualizationData
-                                // The DepthAnalyzer invokes this callback directly.
-                                // We need to switch to the UI thread to update UI elements.
-                                runOnUiThread {
-                                    // Update debug text view using the DetectionState within VisualizationData
-                                    binding.debugText.text = formatDebugText(visData.detectionState)
-                                    // Update the overlay view with the visualization data
-                                    overlayView.updateOverlay(visData)
+                            onResult = { visData: VisualizationData -> // Reçoit VisualizationData
+                                runOnUiThread { // Mettre à jour UI sur le Main Thread
+                                    if (!isFinishing && !isDestroyed) {
+                                        binding.debugText.text = formatDebugText(visData.detectionState)
+                                        overlayView.updateOverlay(visData) // Mettre à jour l'overlay
+                                    }
                                 }
                             }
                         ))
-                        Log.d(TAG, "ImageAnalysis use case built and analyzer set.")
                     }
 
-                // Bind the use cases to the camera lifecycle
                 bindCameraUseCases()
 
             } catch (exc: Exception) {
-                Log.e(TAG, "Error setting up camera provider or use cases: ${exc.message}", exc)
-                Toast.makeText(this, "Failed to initialize camera: ${exc.message}", Toast.LENGTH_LONG).show()
+                Log.e(TAG, "Erreur lors de la configuration CameraProvider ou UseCases", exc)
+                Toast.makeText(this, "Impossible d'initialiser la caméra: ${exc.message}", Toast.LENGTH_LONG).show()
             }
-        }, ContextCompat.getMainExecutor(this)) // Run listener on main thread
+        }, ContextCompat.getMainExecutor(this))
     }
 
-    // Unbinds existing use cases and binds the new ones
     private fun bindCameraUseCases() {
-        val provider = cameraProvider ?: run { Log.e(TAG, "CameraProvider not available."); return }
-        val preview = previewUseCase ?: run { Log.e(TAG, "PreviewUseCase not available."); return }
-        val analysis = imageAnalysisUseCase ?: run { Log.e(TAG, "ImageAnalysisUseCase not available."); return }
+        val provider = cameraProvider ?: run { Log.e(TAG, "CameraProvider non dispo pour binding."); return }
+        val preview = previewUseCase ?: run { Log.e(TAG, "PreviewUseCase non dispo pour binding."); return }
+        val analysis = imageAnalysisUseCase ?: run { Log.e(TAG, "ImageAnalysisUseCase non dispo pour binding."); return }
 
         try {
             provider.unbindAll()
-            Log.d(TAG, "Unbound all previous use cases.")
-
-            // Bind required use cases
-            provider.bindToLifecycle(
-                this, // LifecycleOwner
-                cameraSelector, // Back camera
-                preview, // Show preview
-                analysis // Analyze frames
-            )
-            Log.i(TAG, "Camera use cases bound successfully.")
-
+            provider.bindToLifecycle(this, cameraSelector, preview, analysis)
+            Log.i(TAG, "Use cases caméra liés avec succès.")
         } catch (exc: Exception) {
-            Log.e(TAG, "Use case binding failed: ${exc.message}", exc)
-            Toast.makeText(this, "Failed to bind camera: ${exc.message}", Toast.LENGTH_LONG).show()
+            Log.e(TAG, "Échec liaison use case: ${exc.message}", exc)
+            Toast.makeText(this, "Impossible de lier la caméra: ${exc.message}", Toast.LENGTH_LONG).show()
         }
     }
 
-    /** Formats debug text based on DetectionState */
+    /** Formate le texte de débogage à partir de DetectionState */
     private fun formatDebugText(state: DetectionState): String {
-        // Use the actual threshold from AnalysisManager if possible, or keep it consistent.
-        // Make sure this threshold matches the one used for decision making.
-        val obstacleThreshold = analysisManager?.obstacleClosenessThreshold ?: 1500.0f // Use tuned threshold
+        // Utiliser le seuil depuis Config pour la comparaison ici aussi
+        val obstacleThreshold = Config.OBSTACLE_CLOSENESS_THRESHOLD
         val obstacleStr = if (state.maxObstacleDepth > obstacleThreshold)
-            "Obstacle Close (%.1f)".format(state.maxObstacleDepth) else "Obstacle Far/None"
-        val wallStr = if (state.wallDetected) "Wall Detected" else "No Wall"
-        val pathStr = "Path: ${state.freePathDirection}"
-        // Add timestamp for debugging timing issues
-        // val timeStr = "T: ${state.timestamp % 100000}" // Show last few digits of timestamp
-        return "$obstacleStr\n$wallStr\n$pathStr" //\n$timeStr"
+        // Afficher la valeur de profondeur pour aider au tuning
+            "Obstacle Proche (D=%.1f)".format(state.maxObstacleDepth)
+        else
+            "Obstacle Loin/Non"
+
+        // Afficher la direction du mur si détecté
+        val wallStr = if (state.wallDetected) "Mur (${state.wallDirection})" else "Pas de Mur"
+        val pathStr = "Chemin: ${state.freePathDirection}"
+        // Optionnel: ajouter le timestamp pour voir la fraîcheur des données
+        // val timeStr = "T: ${state.timestamp % 10000}"
+        return "$obstacleStr\n$wallStr\n$pathStr" // \n$timeStr
     }
 
 
     override fun onResume() {
         super.onResume()
-        // Potentially re-check permissions and setup camera if needed
+        Log.d(TAG, "onResume")
+        // Assurer que la caméra redémarre si nécessaire après une pause/permission accordée
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED && cameraProvider == null) {
-            // Only setup if permission granted AND provider isn't already setup
             if (depthPredictor != null && depthPredictor!!.isInitialized) {
+                Log.i(TAG, "Configuration caméra depuis onResume (était en attente).")
                 setupCamera()
             } else {
-                Log.w(TAG, "onResume: Predictor not ready, cannot setup camera yet.")
-                // Maybe re-attempt initialization or show error
+                Log.w(TAG, "onResume: Predictor non prêt, impossible de configurer caméra.")
+                // Afficher un message d'erreur persistant si le modèle n'a pas chargé ?
+                // Toast.makeText(this,"Modèle non chargé!", Toast.LENGTH_SHORT).show()
             }
         }
-        Log.d(TAG, "onResume")
     }
 
     override fun onPause() {
         super.onPause()
         Log.d(TAG, "onPause")
-        // Consider pausing analysis explicitly if needed, though lifecycle binding handles camera
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.d(TAG, "onDestroy: Shutting down...")
-
-        // Cancel background tasks
-        analysisScope.cancel("Activity Destroyed")
-
-        // Shutdown camera executor
+        Log.d(TAG, "onDestroy: Nettoyage et arrêt...")
+        analysisScope.cancel("Activité détruite")
         cameraExecutor.shutdown()
-        Log.d(TAG, "Camera executor shut down.")
-
-        // Release TFLite interpreter
         depthPredictor?.close()
-        Log.d(TAG, "DepthPredictor closed.")
-
-        // Shutdown TTS engine
         feedbackManager?.shutdown()
-        Log.d(TAG, "FeedbackManager shut down.")
-
-        // Clear overlay on destroy (optional, called from UI thread)
-        runOnUiThread { overlayView.updateOverlay(null) }
-
-        // Unbind use cases (CameraX lifecycle should handle this, but explicit call is safe)
-        cameraProvider?.unbindAll()
-        Log.d(TAG, "Camera use cases unbound.")
-
-        Log.d(TAG, "onDestroy: Shutdown complete.")
+        runOnUiThread { overlayView.updateOverlay(null) } // Effacer l'overlay
+        Log.d(TAG, "onDestroy: Nettoyage terminé.")
     }
 }
